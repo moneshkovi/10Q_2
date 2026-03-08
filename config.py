@@ -43,7 +43,7 @@ USER_AGENT = "SECFilingParser/1.0 (research; monesh.kovi@gmail.com)"
 # ============================================================================
 
 # Number of years of historical data to fetch
-LOOKBACK_YEARS: int = 3
+LOOKBACK_YEARS: int = 5
 
 # Filing types to retrieve
 FILING_TYPES: List[str] = ["10-K", "10-Q"]
@@ -108,3 +108,86 @@ XML_PRETTY_PRINT: bool = True
 
 # XML indentation level (spaces)
 XML_INDENT: int = 2
+
+# ============================================================================
+# DCF MODEL CONFIGURATION (Phase 7)
+# ============================================================================
+
+# Forecast horizon (years)
+DCF_FORECAST_YEARS: int = 5
+
+# Risk-free rate (10-year US Treasury yield approximation)
+DCF_RISK_FREE_RATE: float = 0.045  # 4.5%
+
+# Equity risk premium (long-term average)
+DCF_EQUITY_RISK_PREMIUM: float = 0.055  # 5.5% (Damodaran estimate)
+
+# Terminal growth rate (default, typically GDP growth)
+DCF_TERMINAL_GROWTH_RATE: float = 0.025  # 2.5%
+
+# Default EV/EBITDA exit multiple (sector-adjusted at runtime)
+DCF_DEFAULT_EXIT_MULTIPLE: float = 12.0
+
+# Industry beta lookup (Damodaran unlevered betas, re-levered for typical structures)
+# Source: Damodaran Online - Industry Betas (updated annually)
+DCF_INDUSTRY_BETAS: dict = {
+    # Technology - Hardware/Software/Semiconductors
+    "NVDA": 1.65, "AMD": 1.70, "INTC": 1.10, "AVGO": 1.20,
+    "AAPL": 1.20, "MSFT": 0.95, "GOOG": 1.05, "GOOGL": 1.05,
+    "META": 1.30, "AMZN": 1.15, "TSLA": 1.95, "NFLX": 1.40,
+    "CRM": 1.25, "ORCL": 1.00, "ADBE": 1.15, "QCOM": 1.35,
+
+    # Financial Services
+    "BLK": 1.20, "JPM": 1.10, "GS": 1.35, "MS": 1.30,
+    "BAC": 1.40, "WFC": 1.15, "C": 1.45, "SCHW": 1.30,
+    "V": 0.95, "MA": 1.00,
+
+    # Healthcare / Pharma
+    "JNJ": 0.60, "PFE": 0.70, "UNH": 0.75, "LLY": 0.80,
+    "ABBV": 0.75, "MRK": 0.65, "TMO": 0.90, "ABT": 0.85,
+
+    # Consumer / Retail
+    "KO": 0.60, "PEP": 0.60, "PG": 0.45, "WMT": 0.50,
+    "COST": 0.70, "MCD": 0.65, "NKE": 0.85, "SBUX": 0.90,
+
+    # Energy
+    "XOM": 0.95, "CVX": 1.00, "COP": 1.20,
+
+    # Industrials
+    "BA": 1.40, "CAT": 1.05, "GE": 1.15, "HON": 1.00,
+    "UPS": 0.95, "RTX": 0.85,
+
+    # Default for unknown tickers
+    "DEFAULT": 1.00,
+}
+
+# Sector EV/EBITDA exit multiples (for terminal value)
+DCF_SECTOR_MULTIPLES: dict = {
+    "technology": 18.0,
+    "semiconductors": 16.0,
+    "software": 20.0,
+    "financial_services": 10.0,
+    "asset_management": 12.0,
+    "healthcare": 14.0,
+    "pharma": 13.0,
+    "consumer_staples": 15.0,
+    "consumer_discretionary": 14.0,
+    "energy": 6.0,
+    "industrials": 12.0,
+    "utilities": 10.0,
+    "telecom": 8.0,
+    "real_estate": 15.0,
+    "DEFAULT": 12.0,
+}
+
+# Revenue growth tapering (year-by-year multiplier on historical CAGR)
+# Year 1: 90% of CAGR, Year 2: 75%, etc. → converging to terminal rate
+DCF_GROWTH_TAPER: List[float] = [0.90, 0.75, 0.60, 0.45, 0.35]
+
+# Sensitivity analysis ranges
+DCF_SENSITIVITY_WACC_RANGE: List[float] = [-0.02, -0.01, 0.0, 0.01, 0.02]
+DCF_SENSITIVITY_GROWTH_RANGE: List[float] = [-0.01, -0.005, 0.0, 0.005, 0.01]
+
+# Scenario multipliers (Bull / Base / Bear)
+DCF_SCENARIO_BULL_MULTIPLIER: float = 1.20   # 20% above base growth
+DCF_SCENARIO_BEAR_MULTIPLIER: float = 0.70   # 30% below base growth
