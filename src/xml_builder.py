@@ -21,6 +21,8 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +84,8 @@ class XMLBuilder:
 
         ET.SubElement(metadata, "Ticker").text = ticker.upper()
         ET.SubElement(metadata, "CIK").text = xbrl_metrics.get("cik", "")
+        ET.SubElement(metadata, "CUSIP").text = xbrl_metrics.get("cusip") or ""
+        ET.SubElement(metadata, "FIGI").text = xbrl_metrics.get("figi") or ""
         ET.SubElement(metadata, "EntityName").text = xbrl_metrics.get("entity_name", "")
         ET.SubElement(metadata, "FilingsProcessed").text = str(
             xbrl_metrics.get("filings_processed", 0)
@@ -276,7 +280,7 @@ class XMLBuilder:
         for metric_key, metric_data in metrics.items():
             for value_entry in metric_data.get("values", []):
                 form = value_entry.get("form", "")
-                if form == "10-K":
+                if form in config.ANNUAL_FORM_TYPES:
                     period_end = value_entry.get("end")
                     if period_end not in annual_periods:
                         annual_periods[period_end] = {"period_end": period_end}

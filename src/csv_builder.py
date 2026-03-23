@@ -19,6 +19,8 @@ from typing import Dict, List
 from pathlib import Path
 from datetime import datetime
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -228,6 +230,8 @@ class CSVBuilder:
                 writer.writerow(['Metric', 'Value'])
                 writer.writerow(['Ticker', validation_report.get('ticker', '')])
                 writer.writerow(['Entity', validation_report.get('entity_name', '')])
+                writer.writerow(['CUSIP', validation_report.get('cusip') or ''])
+                writer.writerow(['FIGI', validation_report.get('figi') or ''])
                 writer.writerow(['Quality Score', validation_report.get('quality_score', 0)])
                 writer.writerow(['Metrics Validated', validation_report.get('metrics_validated', 0)])
                 writer.writerow([])
@@ -284,7 +288,7 @@ class CSVBuilder:
         for metric_data in metrics.values():
             for value_entry in metric_data.get("values", []):
                 form = value_entry.get("form", "")
-                if form == "10-K":
+                if form in config.ANNUAL_FORM_TYPES:
                     period_end = value_entry.get("end")
                     if period_end not in annual_periods:
                         annual_periods[period_end] = {"period_end": period_end}

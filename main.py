@@ -31,6 +31,8 @@ from src.cli_enhancements import (
     ComparisonReportGenerator, print_banner, print_phase_header
 )
 from src.dcf_calculator import DCFCalculator
+from src.alpaca_client import AlpacaClient
+from src.email_reporter import EmailReporter
 
 
 # ============================================================================
@@ -112,6 +114,8 @@ def process_ticker(ticker: str, perf_stats: PerformanceStats = None) -> Dict:
         "success": False,
         "ticker": ticker.upper(),
         "cik": None,
+        "cusip": None,
+        "figi": None,
         "filings_found": 0,
         "xbrl_available": 0,
         "xbrl_unavailable": 0,
@@ -126,6 +130,9 @@ def process_ticker(ticker: str, perf_stats: PerformanceStats = None) -> Dict:
         "dcf_generated": False,
         "dcf_fair_value": 0,
         "dcf_wacc": 0,
+        "current_price": None,
+        "computed_beta": None,
+        "dcf_premium_pct": None,
         "output_dir": str(config.DATA_DIR / ticker.upper()),
         "errors": []
     }
@@ -159,6 +166,20 @@ def process_ticker(ticker: str, perf_stats: PerformanceStats = None) -> Dict:
             logger.error(f"✗ Ticker validation failed: {e}")
             result["errors"].append(str(e))
             return result
+
+        # Security identifier lookup (enrichment data — non-critical)
+        # FIGI: always available via OpenFIGI free tier
+        # CUSIP: available only for companies reporting dei:SecurityCUSIP in SEC XBRL
+        figi = client.get_figi_from_ticker(ticker)
+        cusip = client.get_cusip_from_ticker(ticker, cik=cik)
+        result["figi"] = figi
+        result["cusip"] = cusip
+        if figi:
+            logger.info(f"✓ FIGI:  {figi}")
+        if cusip:
+            logger.info(f"✓ CUSIP: {cusip}")
+        else:
+            logger.info("  CUSIP: not reported in SEC XBRL DEI facts (non-critical)")
 
         # Step 3: Create output directories
         data_dir = config.DATA_DIR / ticker.upper()
@@ -245,6 +266,10 @@ def process_ticker(ticker: str, perf_stats: PerformanceStats = None) -> Dict:
             )
 
             if metrics_data and 'metrics' in metrics_data:
+                # Inject security identifiers so they flow into XML/CSV output
+                metrics_data['cusip'] = cusip
+                metrics_data['figi'] = figi
+
                 # Save to JSON
                 json_filename = f"{ticker.upper()}_xbrl_metrics.json"
                 json_path = parsed_dir / json_filename
@@ -284,6 +309,9 @@ def process_ticker(ticker: str, perf_stats: PerformanceStats = None) -> Dict:
                     xbrl_metrics=metrics_data,
                     ticker=ticker.upper()
                 )
+                # Propagate security identifiers so they appear in CSV output
+                validation_report['cusip'] = cusip
+                validation_report['figi'] = figi
 
                 # Save validation report
                 validation_filename = f"{ticker.upper()}_validation_report.json"
@@ -401,14 +429,23 @@ def process_ticker(ticker: str, perf_stats: PerformanceStats = None) -> Dict:
         logger.info("PHASE 7: DCF Valuation Model")
         logger.info("=" * 70)
 
+        # Fetch Alpaca beta before DCF so it can be used in WACC calculation
+        _alpaca = AlpacaClient()
+        _computed_beta = _alpaca.calculate_beta(ticker) if _alpaca.enabled else None
+        if _computed_beta is not None:
+            logger.info(f"✓ Alpaca beta computed: {_computed_beta:.3f}")
+        else:
+            logger.info("  Alpaca beta unavailable — using sector lookup")
+
         try:
             if result["metrics_extracted"] > 0 and metrics_data:
                 dcf_calculator = DCFCalculator()
 
-                # Run DCF model
+                # Run DCF model (pass Alpaca-computed beta when available)
                 dcf_result = dcf_calculator.run_dcf(
                     ticker=ticker.upper(),
-                    xbrl_metrics=metrics_data
+                    xbrl_metrics=metrics_data,
+                    beta_override=_computed_beta,
                 )
 
                 if dcf_result.get("success"):
@@ -444,6 +481,33 @@ def process_ticker(ticker: str, perf_stats: PerformanceStats = None) -> Dict:
             logger.error(f"Phase 7 error: {e}", exc_info=True)
             result["errors"].append(f"Phase 7 failed: {str(e)}")
             result["dcf_generated"] = False
+
+        # ========================================================================
+        # PHASE 8: MARKET DATA ENRICHMENT (Alpaca)
+        # ========================================================================
+
+        logger.info("=" * 70)
+        logger.info("PHASE 8: Market Data Enrichment")
+        logger.info("=" * 70)
+
+        try:
+            current_price = _alpaca.get_latest_price(ticker) if _alpaca.enabled else None
+            result["current_price"] = current_price
+            result["computed_beta"] = _computed_beta
+
+            if current_price:
+                logger.info(f"✓ Current price: ${current_price:.2f}")
+            else:
+                logger.info("  Current price unavailable (ticker not on Alpaca feed)")
+
+            if current_price and result.get("dcf_fair_value"):
+                premium_pct = (result["dcf_fair_value"] - current_price) / current_price * 100
+                result["dcf_premium_pct"] = premium_pct
+                direction = "UNDERVALUED" if premium_pct > 0 else "OVERVALUED"
+                logger.info(f"  vs DCF fair value: {premium_pct:+.1f}% ({direction})")
+
+        except Exception as e:
+            logger.warning(f"Phase 8 (market data) failed non-critically: {e}")
 
         # Final Summary
         logger.info("=" * 70)
@@ -568,6 +632,15 @@ def main():
                 if result.get('dcf_generated', False):
                     print(f"  {Colors.OKGREEN}✓{Colors.ENDC} DCF Valuation: "
                           f"${result.get('dcf_fair_value', 0):.2f}/share")
+                    if result.get('current_price'):
+                        prem = result.get('dcf_premium_pct', 0) or 0
+                        sign = "+" if prem >= 0 else ""
+                        direction = "UNDERVALUED" if prem > 0 else "OVERVALUED"
+                        prem_color = Colors.OKGREEN if prem > 0 else Colors.FAIL
+                        print(f"    Current price:  ${result['current_price']:.2f}  "
+                              f"{prem_color}({sign}{prem:.1f}% {direction}){Colors.ENDC}")
+                    if result.get('computed_beta'):
+                        print(f"    Beta (computed): {result['computed_beta']:.2f}")
 
                 if result.get('critical_issues', 0) > 0:
                     print(f"  {Colors.WARNING}⚠{Colors.ENDC}  Critical issues: {result['critical_issues']}")
@@ -606,6 +679,18 @@ def main():
     # Performance summary
     perf_stats.print_summary()
 
+    # =========================================================================
+    # PHASE 9: EMAIL REPORT
+    # =========================================================================
+    reporter = EmailReporter()
+    if reporter.enabled:
+        try:
+            sent = reporter.send_dcf_report(all_results, config.DATA_DIR)
+            if sent:
+                print(f"{Colors.OKGREEN}✓{Colors.ENDC} Report emailed to {config.EMAIL_ADDRESS}")
+        except Exception as e:
+            logger.warning(f"Phase 9 (email) failed non-critically: {e}")
+
     # Final summary
     print(f"\n{Colors.HEADER}{'=' * 70}{Colors.ENDC}")
     print(f"{Colors.HEADER}FINAL SUMMARY{Colors.ENDC}")
@@ -631,8 +716,15 @@ def main():
     # Show DCF fair values
     for t, r in sorted(all_results.items()):
         if r.get('dcf_generated'):
-            print(f"  {Colors.OKCYAN}{t}{Colors.ENDC}: ${r.get('dcf_fair_value', 0):.2f}/share "
-                  f"(WACC={r.get('dcf_wacc', 0):.2%})")
+            line = (f"  {Colors.OKCYAN}{t}{Colors.ENDC}: "
+                    f"${r.get('dcf_fair_value', 0):.2f}/share "
+                    f"(WACC={r.get('dcf_wacc', 0):.2%})")
+            if r.get('current_price'):
+                prem = r.get('dcf_premium_pct') or 0
+                prem_color = Colors.OKGREEN if prem > 0 else Colors.FAIL
+                line += (f"  current=${r['current_price']:.2f} "
+                         f"{prem_color}({prem:+.1f}%){Colors.ENDC}")
+            print(line)
 
     quality_color = Colors.OKGREEN if avg_quality >= 80 else Colors.WARNING if avg_quality >= 50 else Colors.FAIL
     print(f"{Colors.BOLD}Avg quality score:{Colors.ENDC} {quality_color}{avg_quality:.1f}/100{Colors.ENDC}")

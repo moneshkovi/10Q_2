@@ -108,11 +108,17 @@ class XBRLParser:
         entity_name = xbrl_data.get('entityName', 'Unknown')
         logger.info(f"Extracting metrics for {entity_name} ({len(filings)} filings)")
 
-        # Get all facts
+        # Get all facts; auto-detect taxonomy (us-gaap for domestic, ifrs-full for FPIs)
         facts = xbrl_data.get('facts', {})
-        us_gaap = facts.get('us-gaap', {})
+        if facts.get('us-gaap'):
+            taxonomy = 'us-gaap'
+        elif facts.get('ifrs-full'):
+            taxonomy = 'ifrs-full'
+        else:
+            taxonomy = 'us-gaap'  # empty fallback
 
-        logger.info(f"Processing {len(us_gaap)} US-GAAP metrics")
+        taxonomy_data = facts.get(taxonomy, {})
+        logger.info(f"Processing {len(taxonomy_data)} {taxonomy} metrics")
 
         # Build mapping of accession → filing data for quick lookup
         accession_map = {f['accession_number']: f for f in filings}
@@ -121,7 +127,7 @@ class XBRLParser:
         all_metrics = {}
         extracted_count = 0
 
-        for metric_name, metric_data in us_gaap.items():
+        for metric_name, metric_data in taxonomy_data.items():
             units = metric_data.get('units', {})
 
             # For each unit type, extract values
@@ -152,6 +158,7 @@ class XBRLParser:
         return {
             'cik': cik,
             'entity_name': entity_name,
+            'taxonomy': taxonomy,
             'filings_processed': len(filings),
             'metrics_extracted': extracted_count,
             'metrics': all_metrics,

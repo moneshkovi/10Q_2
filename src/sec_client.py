@@ -76,6 +76,12 @@ class SECClient:
         # Cache ticker -> CIK mappings
         self.ticker_to_cik_cache: Dict[str, str] = {}
 
+        # Cache ticker -> CUSIP mappings (None means looked up but not found)
+        self.ticker_to_cusip_cache: Dict[str, Optional[str]] = {}
+
+        # Cache ticker -> FIGI mappings (composite FIGI from OpenFIGI)
+        self.ticker_to_figi_cache: Dict[str, Optional[str]] = {}
+
         logger.info("SECClient initialized")
 
     def _create_session_with_retries(self) -> requests.Session:
@@ -375,6 +381,162 @@ class SECClient:
         except Exception as e:
             logger.error(f"Unexpected error downloading filing {accession_number}: {e}")
             return False
+
+    def _query_openfigi(self, ticker: str) -> Optional[Dict]:
+        """POST a single ticker mapping request to OpenFIGI.
+
+        Returns the first matching instrument dict (composite FIGI scope),
+        or ``None`` on any error.
+
+        Note: The OpenFIGI free tier returns FIGI identifiers but does NOT
+        include ``cusip`` or ``isin`` fields — those are premium-only.
+        """
+        try:
+            payload = [{"idType": "TICKER", "idValue": ticker, "exchCode": "US"}]
+            headers = {
+                "Content-Type": "application/json",
+                "X-OPENFIGI-APIKEY": config.OPENFIGI_API_KEY,
+            }
+            response = self.session.post(
+                config.OPENFIGI_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=config.REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if (data and isinstance(data, list) and
+                    data[0].get("data") and
+                    isinstance(data[0]["data"], list)):
+                return data[0]["data"][0]
+        except Exception as e:
+            logger.debug(f"OpenFIGI query failed for {ticker}: {e}")
+        return None
+
+    def get_figi_from_ticker(self, ticker: str) -> Optional[str]:
+        """Look up the composite FIGI for a ticker symbol via OpenFIGI.
+
+        FIGI (Financial Instrument Global Identifier) is an open standard
+        that uniquely identifies financial instruments globally.
+        The composite FIGI covers all exchanges where the instrument trades.
+
+        This method always works for US-listed tickers with the provided
+        API key; it never raises.
+
+        Args:
+            ticker: Stock ticker symbol (e.g., 'NVDA').
+
+        Returns:
+            12-character composite FIGI string (e.g., 'BBG000BBJQV0'),
+            or ``None`` if not found.
+
+        Example:
+            >>> client = SECClient()
+            >>> figi = client.get_figi_from_ticker('NVDA')
+            >>> print(figi)
+            'BBG000BBJQV0'
+        """
+        ticker = ticker.upper().strip()
+
+        if ticker in self.ticker_to_figi_cache:
+            return self.ticker_to_figi_cache[ticker]
+
+        figi: Optional[str] = None
+        instrument = self._query_openfigi(ticker)
+        if instrument:
+            figi = instrument.get("compositeFIGI") or instrument.get("figi")
+            if figi:
+                logger.info(f"FIGI for {ticker}: {figi}")
+
+        if figi is None:
+            logger.info(f"FIGI not found for {ticker} (non-critical)")
+
+        self.ticker_to_figi_cache[ticker] = figi
+        return figi
+
+    def get_cusip_from_ticker(self, ticker: str,
+                              cik: Optional[str] = None) -> Optional[str]:
+        """Look up the CUSIP for a ticker symbol.
+
+        Tries sources in order:
+        1. OpenFIGI API — free tier returns FIGI fields only; ``cusip`` is
+           populated if OpenFIGI ever includes it in the response.
+        2. SEC XBRL DEI facts — ``dei:SecurityCUSIP`` in the companyfacts
+           endpoint. Requires ``cik``. Most large-cap US companies do NOT
+           include this tag, so coverage is limited to smaller filers.
+
+        CUSIP is enrichment data and is non-critical for pipeline correctness.
+        This method never raises; it returns ``None`` when lookup fails.
+
+        Args:
+            ticker: Stock ticker symbol (e.g., 'NVDA').
+            cik: Optional 10-digit zero-padded CIK. When provided, enables
+                the SEC DEI fallback path.
+
+        Returns:
+            9-character alphanumeric CUSIP string, or ``None`` if not found.
+        """
+        ticker = ticker.upper().strip()
+
+        if ticker in self.ticker_to_cusip_cache:
+            return self.ticker_to_cusip_cache[ticker]
+
+        cusip: Optional[str] = None
+
+        # ------------------------------------------------------------------
+        # Source 1: OpenFIGI API (free tier — CUSIP field present if provided)
+        # ------------------------------------------------------------------
+        instrument = self._query_openfigi(ticker)
+        if instrument:
+            # Also opportunistically cache the FIGI
+            figi = instrument.get("compositeFIGI") or instrument.get("figi")
+            if figi and ticker not in self.ticker_to_figi_cache:
+                self.ticker_to_figi_cache[ticker] = figi
+
+            candidate = instrument.get("cusip", "")
+            if candidate and len(candidate) == 9 and candidate.isalnum():
+                cusip = candidate
+                logger.info(f"CUSIP for {ticker} from OpenFIGI: {cusip}")
+
+        # ------------------------------------------------------------------
+        # Source 2: SEC XBRL DEI facts (fallback when OpenFIGI yields nothing)
+        # ------------------------------------------------------------------
+        if cusip is None and cik:
+            try:
+                url = (
+                    f"https://data.sec.gov/api/xbrl/companyfacts"
+                    f"/CIK{cik}.json"
+                )
+                response = self.session.get(
+                    url,
+                    headers=self.headers,
+                    timeout=config.REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                facts = response.json()
+
+                # dei:SecurityCUSIP values are stored as unitless strings
+                dei_facts = facts.get("facts", {}).get("dei", {})
+                security_cusip = dei_facts.get("SecurityCUSIP", {})
+                units = security_cusip.get("units", {})
+                # Unit key for string facts is "" (empty string)
+                entries = units.get("", [])
+                if entries:
+                    # Use the value from the most recently filed entry
+                    latest = max(entries, key=lambda e: e.get("filed", ""))
+                    candidate = str(latest.get("val", ""))
+                    if candidate and len(candidate) == 9 and candidate.isalnum():
+                        cusip = candidate
+                        logger.info(f"CUSIP for {ticker} from SEC DEI facts: {cusip}")
+            except Exception as e:
+                logger.debug(f"SEC DEI fallback failed for {ticker}: {e}")
+
+        if cusip is None:
+            logger.info(f"CUSIP not found for {ticker} (non-critical)")
+
+        # Cache result (including None, to avoid repeated failed lookups)
+        self.ticker_to_cusip_cache[ticker] = cusip
+        return cusip
 
     def get_xbrl_url(self, accession_number: str) -> Optional[str]:
         """Get URL to XBRL data for a filing.

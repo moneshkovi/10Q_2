@@ -438,3 +438,124 @@ class TestIntegration:
                 assert isinstance(val, (int, float)), \
                     f"Non-numeric value in {metric_key}: {val}"
 
+
+# ============================================================================
+# TESTS: IFRS TAXONOMY DETECTION (20-F / foreign private issuers)
+# ============================================================================
+
+class TestIFRSTaxonomyDetection:
+    """
+    Test auto-detection of IFRS-full taxonomy vs US-GAAP.
+    Uses mocked XBRL responses so no network calls are needed.
+    """
+
+    @pytest.fixture
+    def mock_ifrs_xbrl(self):
+        """Mock XBRL companyfacts response using ifrs-full instead of us-gaap."""
+        return {
+            "cik": "0000875320",
+            "entityName": "ASTRAZENECA PLC",
+            "facts": {
+                "ifrs-full": {
+                    "Revenue": {
+                        "label": "Revenue",
+                        "units": {
+                            "USD": [
+                                {
+                                    "val": 54072000000,
+                                    "end": "2024-12-31",
+                                    "form": "20-F",
+                                    "filed": "2025-02-20",
+                                    "accn": "0000875320-25-000010",
+                                },
+                            ]
+                        },
+                    },
+                    "ProfitLoss": {
+                        "label": "Profit (loss)",
+                        "units": {
+                            "USD": [
+                                {
+                                    "val": 5955000000,
+                                    "end": "2024-12-31",
+                                    "form": "20-F",
+                                    "filed": "2025-02-20",
+                                    "accn": "0000875320-25-000010",
+                                },
+                            ]
+                        },
+                    },
+                }
+            },
+        }
+
+    @pytest.fixture
+    def azn_filings(self):
+        """AZN 20-F filing metadata."""
+        return [
+            {
+                "accession_number": "0000875320-25-000010",
+                "filing_date": "2025-02-20",
+                "fiscal_period_end": "2024-12-31",
+                "form_type": "20-F",
+                "is_xbrl": True,
+            },
+        ]
+
+    def test_ifrs_taxonomy_detected(self, parser, mock_ifrs_xbrl, azn_filings, monkeypatch):
+        """IFRS-full taxonomy is detected when us-gaap facts are absent."""
+        monkeypatch.setattr(parser, "fetch_xbrl_data", lambda cik: mock_ifrs_xbrl)
+        result = parser.extract_metrics_for_filings(
+            cik="0000875320",
+            filings=azn_filings,
+            lookback_years=3,
+        )
+        assert result["taxonomy"] == "ifrs-full"
+
+    def test_ifrs_metrics_extracted(self, parser, mock_ifrs_xbrl, azn_filings, monkeypatch):
+        """Metrics are extracted from ifrs-full facts."""
+        monkeypatch.setattr(parser, "fetch_xbrl_data", lambda cik: mock_ifrs_xbrl)
+        result = parser.extract_metrics_for_filings(
+            cik="0000875320",
+            filings=azn_filings,
+            lookback_years=3,
+        )
+        assert result["metrics_extracted"] > 0
+        # Revenue metric should be present
+        assert any("Revenue" in key for key in result["metrics"])
+
+    def test_usgaap_taxonomy_default(self, parser, monkeypatch):
+        """US-GAAP is detected when us-gaap facts are present."""
+        mock_gaap = {
+            "entityName": "US CORP",
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "label": "Revenues",
+                        "units": {
+                            "USD": [
+                                {"val": 100, "end": "2024-12-31", "form": "10-K",
+                                 "filed": "2025-02-01", "accn": "0000000001-25-000001"}
+                            ]
+                        },
+                    }
+                }
+            },
+        }
+        filings = [{"accession_number": "0000000001-25-000001", "filing_date": "2025-02-01",
+                    "fiscal_period_end": "2024-12-31", "form_type": "10-K", "is_xbrl": True}]
+        monkeypatch.setattr(parser, "fetch_xbrl_data", lambda cik: mock_gaap)
+        result = parser.extract_metrics_for_filings(
+            cik="0000000001", filings=filings, lookback_years=3
+        )
+        assert result["taxonomy"] == "us-gaap"
+
+    def test_fallback_taxonomy_when_empty(self, parser, monkeypatch):
+        """Taxonomy falls back to us-gaap when facts dict is empty."""
+        mock_empty = {"entityName": "EMPTY CORP", "facts": {}}
+        monkeypatch.setattr(parser, "fetch_xbrl_data", lambda cik: mock_empty)
+        result = parser.extract_metrics_for_filings(
+            cik="0000000002", filings=[], lookback_years=3
+        )
+        assert result["taxonomy"] == "us-gaap"
+

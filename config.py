@@ -4,8 +4,12 @@ This module defines all constants, paths, and settings used throughout
 the application. Centralize configuration here to make adjustments easy.
 """
 
+import os
 from pathlib import Path
 from typing import List
+
+from dotenv import load_dotenv
+load_dotenv()  # Load secrets from .env file (never committed to version control)
 
 # ============================================================================
 # DIRECTORIES & PATHS
@@ -34,6 +38,31 @@ SEC_BASE_URL = "https://www.sec.gov"
 SEC_EDGAR_SUBMISSIONS_API = "https://data.sec.gov/submissions"
 SEC_EDGAR_COMPANY_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 
+# OpenFIGI API for CUSIP / ISIN / FIGI lookups (primary source)
+# Docs: https://www.openfigi.com/api
+OPENFIGI_API_URL = "https://api.openfigi.com/v3/mapping"
+OPENFIGI_API_KEY: str = os.getenv("OPENFIGI_API_KEY", "")
+
+# ============================================================================
+# ALPACA MARKET DATA CONFIGURATION
+# ============================================================================
+
+# Alpaca market data API (free tier: IEX feed, ~1-min delay)
+# Docs: https://docs.alpaca.markets/reference/stocksnapshotsingle
+ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_DATA_URL: str = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets/v2")
+
+# ============================================================================
+# EMAIL REPORTING CONFIGURATION
+# ============================================================================
+
+# Gmail SMTP with app password (generate at myaccount.google.com/apppasswords)
+EMAIL_ADDRESS: str = os.getenv("EMAIL_ADDRESS", "")
+EMAIL_APP_PASSWORD: str = os.getenv("EMAIL_APP_PASSWORD", "")
+EMAIL_SMTP_HOST: str = "smtp.gmail.com"
+EMAIL_SMTP_PORT: int = 587
+
 # User agent string (SEC requires this to identify your application)
 # Update this to identify your application
 USER_AGENT = "SECFilingParser/1.0 (research; monesh.kovi@gmail.com)"
@@ -45,8 +74,14 @@ USER_AGENT = "SECFilingParser/1.0 (research; monesh.kovi@gmail.com)"
 # Number of years of historical data to fetch
 LOOKBACK_YEARS: int = 5
 
-# Filing types to retrieve
-FILING_TYPES: List[str] = ["10-K", "10-Q"]
+# Filing types to retrieve (includes 20-F/6-K for foreign private issuers)
+FILING_TYPES: List[str] = ["10-K", "10-Q", "20-F", "6-K"]
+
+# Annual form types: 10-K for US domestic, 20-F for foreign private issuers (FPIs)
+ANNUAL_FORM_TYPES: List[str] = ["10-K", "20-F"]
+
+# Interim/current form types: 10-Q for US domestic, 6-K for FPIs
+INTERIM_FORM_TYPES: List[str] = ["10-Q", "6-K"]
 
 # ============================================================================
 # NETWORK & RETRY CONFIGURATION

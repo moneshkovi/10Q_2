@@ -131,6 +131,64 @@ EBITDA_KEYS = [
     # Not a standard XBRL field - we calculate it
 ]
 
+# ============================================================================
+# IFRS-FULL TAXONOMY KEYS (foreign private issuers filing 20-F, e.g. AZN)
+# Source: IFRS Foundation XBRL taxonomy; verified against AZN EDGAR filings
+# ============================================================================
+IFRS_REVENUE_KEYS = [
+    "Revenue",
+    "RevenueFromContractsWithCustomers",
+]
+IFRS_OPERATING_INCOME_KEYS = [
+    "ProfitLossFromOperatingActivities",
+]
+IFRS_NET_INCOME_KEYS = [
+    "ProfitLoss",
+    "ProfitLossAttributableToOwnersOfParent",
+]
+IFRS_EBIT_KEYS = [
+    "ProfitLossFromOperatingActivities",
+]
+IFRS_TAX_KEYS = [
+    "IncomeTaxExpenseContinuingOperations",
+]
+IFRS_DA_KEYS = [
+    "DepreciationDepletionAmortisationExpense",
+    "DepreciationAndAmortisationExpense",
+]
+IFRS_INTEREST_KEYS = [
+    "FinanceExpense",
+    "InterestExpense",
+    "InterestCosts",
+]
+IFRS_CAPEX_KEYS = [
+    "PurchaseOfPropertyPlantAndEquipment",
+    "AcquisitionOfPropertyPlantAndEquipment",
+]
+IFRS_OPERATING_CF_KEYS = [
+    "CashFlowsFromUsedInOperatingActivities",
+    "NetCashFromOperatingActivities",
+]
+IFRS_TOTAL_ASSETS_KEYS = ["Assets"]
+IFRS_CURRENT_ASSETS_KEYS = ["CurrentAssets"]
+IFRS_CURRENT_LIABILITIES_KEYS = ["CurrentLiabilities"]
+IFRS_TOTAL_DEBT_KEYS = ["NoncurrentBorrowings", "Borrowings"]
+IFRS_SHORT_TERM_DEBT_KEYS = ["CurrentBorrowings", "ShorttermBorrowings"]
+IFRS_CASH_KEYS = ["CashAndCashEquivalents"]
+IFRS_EQUITY_KEYS = [
+    "EquityAttributableToOwnersOfParent",
+    "Equity",
+]
+IFRS_SHARES_KEYS = [
+    "WeightedAverageShares",
+    "AdjustedWeightedAverageShares",
+]
+IFRS_GROSS_PROFIT_KEYS = ["GrossProfit"]
+IFRS_COGS_KEYS = ["CostOfSales", "CostOfGoodsAndServices"]
+IFRS_PRETAX_INCOME_KEYS = [
+    "ProfitLossBeforeTax",
+]
+
 
 class DCFCalculator:
     """
@@ -160,13 +218,17 @@ class DCFCalculator:
     # MAIN ENTRY POINT
     # ========================================================================
 
-    def run_dcf(self, ticker: str, xbrl_metrics: Dict) -> Dict:
+    def run_dcf(self, ticker: str, xbrl_metrics: Dict,
+                beta_override: Optional[float] = None) -> Dict:
         """
         Run complete DCF valuation for a ticker.
 
         Args:
             ticker: Stock ticker symbol
             xbrl_metrics: XBRL metrics from Phase 3
+            beta_override: Pre-computed beta (e.g. from Alpaca OLS). When provided,
+                           overrides the sector-lookup beta in config.DCF_INDUSTRY_BETAS.
+                           Pass None to use the sector lookup (default behaviour).
 
         Returns:
             Complete DCF result dictionary with all components
@@ -184,8 +246,9 @@ class DCFCalculator:
         # Step 2: Calculate historical FCF and key metrics
         historical_fcf = self._calculate_historical_fcf(historicals)
 
-        # Step 3: Calculate WACC
-        wacc_result = self._calculate_wacc(ticker, historicals)
+        # Step 3: Calculate WACC (use Alpaca-computed beta when available)
+        wacc_result = self._calculate_wacc(ticker, historicals,
+                                           beta_override=beta_override)
 
         # Step 4: Forecast future FCF
         fcf_forecast = self._forecast_fcf(historicals, historical_fcf)
@@ -280,7 +343,8 @@ class DCFCalculator:
 
             for value_entry in metric_data.get("values", []):
                 form = value_entry.get("form", "")
-                if form != "10-K":
+                # Accept annual forms: 10-K (US domestic) and 20-F (foreign private issuers)
+                if form not in config.ANNUAL_FORM_TYPES:
                     continue
 
                 period_end = value_entry.get("end", "")
@@ -297,6 +361,16 @@ class DCFCalculator:
         # Sort by period (most recent first)
         sorted_periods = sorted(annual_data.keys(), reverse=True)
         result = [annual_data[p] for p in sorted_periods]
+
+        # Filter out sub-annual balance sheet snapshots (quarterly dates that
+        # appear inside 10-K/20-F filings but have no income statement data).
+        # A valid fiscal-year period must have at least one revenue or income metric.
+        # Includes both US-GAAP and IFRS-full names.
+        income_stmt_keys = set(
+            REVENUE_KEYS + NET_INCOME_KEYS + OPERATING_INCOME_KEYS
+            + IFRS_REVENUE_KEYS + IFRS_NET_INCOME_KEYS + IFRS_OPERATING_INCOME_KEYS
+        )
+        result = [p for p in result if any(k in p for k in income_stmt_keys)]
 
         logger.info(f"Extracted {len(result)} annual periods for DCF")
         return result
@@ -330,23 +404,24 @@ class DCFCalculator:
         for i, period in enumerate(historicals):
             period_end = period.get("period_end", "Unknown")
 
-            # Extract key financials
-            revenue = self._lookup_metric(period, REVENUE_KEYS)
-            ebit = self._lookup_metric(period, EBIT_KEYS)
-            net_income = self._lookup_metric(period, NET_INCOME_KEYS)
-            d_a = self._lookup_metric(period, DA_KEYS, 0)
-            capex = self._lookup_metric(period, CAPEX_KEYS, 0)
-            operating_cf = self._lookup_metric(period, OPERATING_CF_KEYS)
-            tax_expense = self._lookup_metric(period, TAX_EXPENSE_KEYS, 0)
-            pretax_income = self._lookup_metric(period, PRETAX_INCOME_KEYS)
-            interest_expense = self._lookup_metric(period, INTEREST_EXPENSE_KEYS, 0)
-            gross_profit = self._lookup_metric(period, GROSS_PROFIT_KEYS)
-            cogs = self._lookup_metric(period, COGS_KEYS)
+            # Extract key financials — try US-GAAP keys first, then IFRS-full equivalents
+            # so both domestic (10-K) and FPI (20-F) companies work transparently.
+            revenue = self._lookup_metric(period, REVENUE_KEYS + IFRS_REVENUE_KEYS)
+            ebit = self._lookup_metric(period, EBIT_KEYS + IFRS_EBIT_KEYS)
+            net_income = self._lookup_metric(period, NET_INCOME_KEYS + IFRS_NET_INCOME_KEYS)
+            d_a = self._lookup_metric(period, DA_KEYS + IFRS_DA_KEYS, 0)
+            capex = self._lookup_metric(period, CAPEX_KEYS + IFRS_CAPEX_KEYS, 0)
+            operating_cf = self._lookup_metric(period, OPERATING_CF_KEYS + IFRS_OPERATING_CF_KEYS)
+            tax_expense = self._lookup_metric(period, TAX_EXPENSE_KEYS + IFRS_TAX_KEYS, 0)
+            pretax_income = self._lookup_metric(period, PRETAX_INCOME_KEYS + IFRS_PRETAX_INCOME_KEYS)
+            interest_expense = self._lookup_metric(period, INTEREST_EXPENSE_KEYS + IFRS_INTEREST_KEYS, 0)
+            gross_profit = self._lookup_metric(period, GROSS_PROFIT_KEYS + IFRS_GROSS_PROFIT_KEYS)
+            cogs = self._lookup_metric(period, COGS_KEYS + IFRS_COGS_KEYS)
 
             # Current assets/liabilities for NWC
-            current_assets = self._lookup_metric(period, CURRENT_ASSETS_KEYS, 0)
-            current_liabilities = self._lookup_metric(period, CURRENT_LIABILITIES_KEYS, 0)
-            cash = self._lookup_metric(period, CASH_KEYS, 0)
+            current_assets = self._lookup_metric(period, CURRENT_ASSETS_KEYS + IFRS_CURRENT_ASSETS_KEYS, 0)
+            current_liabilities = self._lookup_metric(period, CURRENT_LIABILITIES_KEYS + IFRS_CURRENT_LIABILITIES_KEYS, 0)
+            cash = self._lookup_metric(period, CASH_KEYS + IFRS_CASH_KEYS, 0)
 
             # Calculate effective tax rate
             if pretax_income and pretax_income > 0 and tax_expense is not None:
@@ -371,9 +446,9 @@ class DCFCalculator:
             delta_nwc = 0
             if i < len(historicals) - 1:
                 prior = historicals[i + 1]
-                prior_ca = self._lookup_metric(prior, CURRENT_ASSETS_KEYS, 0)
-                prior_cl = self._lookup_metric(prior, CURRENT_LIABILITIES_KEYS, 0)
-                prior_cash = self._lookup_metric(prior, CASH_KEYS, 0)
+                prior_ca = self._lookup_metric(prior, CURRENT_ASSETS_KEYS + IFRS_CURRENT_ASSETS_KEYS, 0)
+                prior_cl = self._lookup_metric(prior, CURRENT_LIABILITIES_KEYS + IFRS_CURRENT_LIABILITIES_KEYS, 0)
+                prior_cash = self._lookup_metric(prior, CASH_KEYS + IFRS_CASH_KEYS, 0)
                 prior_nwc = (prior_ca - prior_cash) - prior_cl if prior_ca else 0
                 delta_nwc = nwc - prior_nwc
 
@@ -392,8 +467,9 @@ class DCFCalculator:
                 interest_tax_shield = abs(interest_expense) * (1 - effective_tax_rate) if interest_expense else 0
                 fcff_ocf = operating_cf - capex_abs + interest_tax_shield
 
-            # Use EBIT method as primary, OCF as fallback
-            fcff = fcff_ebit if fcff_ebit is not None else fcff_ocf
+            # Prefer OCF method (direct, avoids NWC estimation errors).
+            # Fall back to EBIT method only when operating CF is unavailable.
+            fcff = fcff_ocf if fcff_ocf is not None else fcff_ebit
 
             # Calculate margins
             gross_margin = (gross_profit / revenue) if (revenue and gross_profit) else None
@@ -430,15 +506,15 @@ class DCFCalculator:
                 "fcf_margin": fcf_margin,
 
                 # Balance sheet items
-                "total_assets": self._lookup_metric(period, TOTAL_ASSETS_KEYS),
+                "total_assets": self._lookup_metric(period, TOTAL_ASSETS_KEYS + IFRS_TOTAL_ASSETS_KEYS),
                 "current_assets": current_assets,
                 "current_liabilities": current_liabilities,
                 "cash": cash,
                 "short_term_investments": self._lookup_metric(period, SHORT_TERM_INVESTMENTS_KEYS, 0),
-                "total_debt": self._lookup_metric(period, TOTAL_DEBT_KEYS, 0),
-                "short_term_debt": self._lookup_metric(period, SHORT_TERM_DEBT_KEYS, 0),
-                "equity": self._lookup_metric(period, EQUITY_KEYS),
-                "shares_outstanding": self._lookup_metric(period, SHARES_OUTSTANDING_KEYS),
+                "total_debt": self._lookup_metric(period, TOTAL_DEBT_KEYS + IFRS_TOTAL_DEBT_KEYS, 0),
+                "short_term_debt": self._lookup_metric(period, SHORT_TERM_DEBT_KEYS + IFRS_SHORT_TERM_DEBT_KEYS, 0),
+                "equity": self._lookup_metric(period, EQUITY_KEYS + IFRS_EQUITY_KEYS),
+                "shares_outstanding": self._lookup_metric(period, SHARES_OUTSTANDING_KEYS + IFRS_SHARES_KEYS),
             }
 
             fcf_data.append(entry)
@@ -449,7 +525,8 @@ class DCFCalculator:
     # STEP 3: CALCULATE WACC
     # ========================================================================
 
-    def _calculate_wacc(self, ticker: str, historicals: List[Dict]) -> Dict:
+    def _calculate_wacc(self, ticker: str, historicals: List[Dict],
+                        beta_override: Optional[float] = None) -> Dict:
         """
         Calculate Weighted Average Cost of Capital (WACC).
 
@@ -465,17 +542,22 @@ class DCFCalculator:
         """
         latest = historicals[0] if historicals else {}
 
-        # Get beta
-        beta = config.DCF_INDUSTRY_BETAS.get(ticker,
-               config.DCF_INDUSTRY_BETAS.get("DEFAULT", 1.0))
+        # Beta: prefer live Alpaca-computed OLS beta; fall back to sector lookup
+        if beta_override is not None:
+            beta = beta_override
+            beta_source = "computed"   # Alpaca OLS vs SPY
+        else:
+            beta = config.DCF_INDUSTRY_BETAS.get(
+                ticker, config.DCF_INDUSTRY_BETAS.get("DEFAULT", 1.0))
+            beta_source = "sector_lookup"
 
         # Cost of Equity (CAPM)
         cost_of_equity = self.risk_free_rate + beta * self.equity_risk_premium
 
         # Cost of Debt
-        interest_expense = self._lookup_metric(latest, INTEREST_EXPENSE_KEYS, 0)
-        total_debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS, 0)
-        short_term_debt = self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS, 0)
+        interest_expense = self._lookup_metric(latest, INTEREST_EXPENSE_KEYS + IFRS_INTEREST_KEYS, 0)
+        total_debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS + IFRS_TOTAL_DEBT_KEYS, 0)
+        short_term_debt = self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS + IFRS_SHORT_TERM_DEBT_KEYS, 0)
         total_debt_all = total_debt + short_term_debt
 
         if total_debt_all > 0 and interest_expense:
@@ -485,8 +567,8 @@ class DCFCalculator:
             cost_of_debt = self.risk_free_rate + 0.015  # Rf + 1.5% credit spread
 
         # Tax rate
-        tax_expense = self._lookup_metric(latest, TAX_EXPENSE_KEYS, 0)
-        pretax_income = self._lookup_metric(latest, PRETAX_INCOME_KEYS)
+        tax_expense = self._lookup_metric(latest, TAX_EXPENSE_KEYS + IFRS_TAX_KEYS, 0)
+        pretax_income = self._lookup_metric(latest, PRETAX_INCOME_KEYS + IFRS_PRETAX_INCOME_KEYS)
         if pretax_income and pretax_income > 0 and tax_expense:
             tax_rate = abs(tax_expense) / pretax_income
             tax_rate = min(max(tax_rate, 0.0), 0.50)
@@ -494,7 +576,7 @@ class DCFCalculator:
             tax_rate = 0.21
 
         # Capital structure weights
-        equity = self._lookup_metric(latest, EQUITY_KEYS, 0)
+        equity = self._lookup_metric(latest, EQUITY_KEYS + IFRS_EQUITY_KEYS, 0)
         if equity and equity > 0:
             total_capital = equity + total_debt_all
             weight_equity = equity / total_capital
@@ -516,6 +598,7 @@ class DCFCalculator:
             "cost_of_debt": cost_of_debt,
             "after_tax_cost_of_debt": cost_of_debt * (1 - tax_rate),
             "beta": beta,
+            "beta_source": beta_source,
             "risk_free_rate": self.risk_free_rate,
             "equity_risk_premium": self.equity_risk_premium,
             "tax_rate": tax_rate,
@@ -833,15 +916,15 @@ class DCFCalculator:
         latest_fcf = None
 
         # Get balance sheet items from latest period
-        cash = self._lookup_metric(latest, CASH_KEYS, 0)
+        cash = self._lookup_metric(latest, CASH_KEYS + IFRS_CASH_KEYS, 0)
         st_investments = self._lookup_metric(latest, SHORT_TERM_INVESTMENTS_KEYS, 0)
         total_cash = cash + st_investments
 
-        total_debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS, 0)
-        st_debt = self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS, 0)
+        total_debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS + IFRS_TOTAL_DEBT_KEYS, 0)
+        st_debt = self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS + IFRS_SHORT_TERM_DEBT_KEYS, 0)
         total_debt_all = total_debt + st_debt
 
-        shares = self._lookup_metric(latest, SHARES_OUTSTANDING_KEYS)
+        shares = self._lookup_metric(latest, SHARES_OUTSTANDING_KEYS + IFRS_SHARES_KEYS)
 
         # Calculate equity values for each TV method
         results = {}
@@ -884,11 +967,11 @@ class DCFCalculator:
         2. WACC vs Revenue Growth → Fair Value matrix
         """
         latest = historicals[0] if historicals else {}
-        cash = self._lookup_metric(latest, CASH_KEYS, 0) + \
+        cash = self._lookup_metric(latest, CASH_KEYS + IFRS_CASH_KEYS, 0) + \
                self._lookup_metric(latest, SHORT_TERM_INVESTMENTS_KEYS, 0)
-        total_debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS, 0) + \
-                     self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS, 0)
-        shares = self._lookup_metric(latest, SHARES_OUTSTANDING_KEYS, 1)
+        total_debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS + IFRS_TOTAL_DEBT_KEYS, 0) + \
+                     self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS + IFRS_SHORT_TERM_DEBT_KEYS, 0)
+        shares = self._lookup_metric(latest, SHARES_OUTSTANDING_KEYS + IFRS_SHARES_KEYS, 1)
 
         # === Table 1: WACC vs Terminal Growth Rate ===
         wacc_range = [base_wacc + delta for delta in config.DCF_SENSITIVITY_WACC_RANGE]
@@ -958,11 +1041,11 @@ class DCFCalculator:
         latest_fcf = historical_fcf[0] if historical_fcf else {}
         latest = historicals[0] if historicals else {}
 
-        cash = self._lookup_metric(latest, CASH_KEYS, 0) + \
+        cash = self._lookup_metric(latest, CASH_KEYS + IFRS_CASH_KEYS, 0) + \
                self._lookup_metric(latest, SHORT_TERM_INVESTMENTS_KEYS, 0)
-        debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS, 0) + \
-               self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS, 0)
-        shares = self._lookup_metric(latest, SHARES_OUTSTANDING_KEYS, 1)
+        debt = self._lookup_metric(latest, TOTAL_DEBT_KEYS + IFRS_TOTAL_DEBT_KEYS, 0) + \
+               self._lookup_metric(latest, SHORT_TERM_DEBT_KEYS + IFRS_SHORT_TERM_DEBT_KEYS, 0)
+        shares = self._lookup_metric(latest, SHARES_OUTSTANDING_KEYS + IFRS_SHARES_KEYS, 1)
 
         revenue = latest_fcf.get("revenue", 0)
         fcf = latest_fcf.get("fcff", 0)

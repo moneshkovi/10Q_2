@@ -12,6 +12,7 @@ Tests cover:
 import json
 import pytest
 from pathlib import Path
+from typing import Optional
 from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime, timedelta
 
@@ -485,3 +486,225 @@ class TestDownloadFilingPDF:
             assert result is True
             assert output_file.exists()
             assert output_file.parent.exists()
+
+
+# ============================================================================
+# TESTS: get_cusip_from_ticker
+# ============================================================================
+
+class TestGetCUSIP:
+    """Tests for CUSIP lookup via OpenFIGI (primary) and SEC DEI (fallback),
+    and for FIGI lookup via OpenFIGI."""
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_openfigi_response(self, cusip: Optional[str] = None,
+                                figi: str = "BBG000BBJQV0") -> dict:
+        """Build a minimal successful OpenFIGI mapping response.
+
+        If cusip is None the response does not include a 'cusip' key,
+        matching the real free-tier behaviour.
+        """
+        instrument = {
+            "figi": figi,
+            "compositeFIGI": figi,
+            "name": "TEST CORP",
+            "ticker": "TEST",
+            "exchCode": "US",
+        }
+        if cusip is not None:
+            instrument["cusip"] = cusip
+        return [{"data": [instrument]}]
+
+    def _make_dei_response(self, cik: str, cusip: str) -> dict:
+        """Build a minimal SEC companyfacts response with SecurityCUSIP."""
+        return {
+            "cik": cik,
+            "entityName": "TEST CORP",
+            "facts": {
+                "dei": {
+                    "SecurityCUSIP": {
+                        "label": "Security CUSIP",
+                        "units": {
+                            "": [
+                                {"val": cusip, "end": "2025-01-26",
+                                 "filed": "2025-02-26", "form": "10-K"}
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+
+    # ------------------------------------------------------------------
+    # FIGI lookup (always works in free tier)
+    # ------------------------------------------------------------------
+
+    def test_figi_from_openfigi_success(self, client):
+        """OpenFIGI returns a valid composite FIGI for a ticker."""
+        with patch.object(client.session, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = self._make_openfigi_response(
+                figi="BBG000BBJQV0"
+            )
+            mock_response.raise_for_status = Mock()
+            mock_post.return_value = mock_response
+
+            figi = client.get_figi_from_ticker("NVDA")
+
+            assert figi == "BBG000BBJQV0"
+            assert mock_post.called
+
+    def test_figi_cache_hit(self, client):
+        """Second call for same ticker uses cached FIGI."""
+        with patch.object(client.session, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = self._make_openfigi_response(
+                figi="BBG000BBJQV0"
+            )
+            mock_response.raise_for_status = Mock()
+            mock_post.return_value = mock_response
+
+            figi1 = client.get_figi_from_ticker("NVDA")
+            figi2 = client.get_figi_from_ticker("NVDA")
+
+            assert figi1 == figi2 == "BBG000BBJQV0"
+            assert mock_post.call_count == 1
+
+    def test_figi_returns_none_on_failure(self, client):
+        """Returns None (never raises) when OpenFIGI fails."""
+        with patch.object(client.session, "post") as mock_post:
+            mock_post.side_effect = Exception("network error")
+            figi = client.get_figi_from_ticker("NVDA")
+            assert figi is None
+
+    # ------------------------------------------------------------------
+    # CUSIP: OpenFIGI path (works when cusip field is in response)
+    # ------------------------------------------------------------------
+
+    def test_cusip_from_openfigi_success(self, client):
+        """OpenFIGI response with cusip field yields valid CUSIP."""
+        with patch.object(client.session, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = self._make_openfigi_response(
+                cusip="67066G104"
+            )
+            mock_response.raise_for_status = Mock()
+            mock_post.return_value = mock_response
+
+            cusip = client.get_cusip_from_ticker("NVDA")
+
+            assert cusip == "67066G104"
+
+    def test_cusip_lowercase_ticker_normalised(self, client):
+        """Ticker is uppercased before lookup."""
+        with patch.object(client.session, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = self._make_openfigi_response(
+                cusip="037833100"
+            )
+            mock_response.raise_for_status = Mock()
+            mock_post.return_value = mock_response
+
+            cusip = client.get_cusip_from_ticker("aapl")
+            assert cusip == "037833100"
+
+    # ------------------------------------------------------------------
+    # CUSIP: cache behaviour
+    # ------------------------------------------------------------------
+
+    def test_cusip_cache_hit(self, client):
+        """Second call for same ticker uses cached value; only one HTTP call."""
+        with patch.object(client.session, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = self._make_openfigi_response(
+                cusip="67066G104"
+            )
+            mock_response.raise_for_status = Mock()
+            mock_post.return_value = mock_response
+
+            cusip1 = client.get_cusip_from_ticker("NVDA")
+            cusip2 = client.get_cusip_from_ticker("NVDA")
+
+            assert cusip1 == cusip2 == "67066G104"
+            assert mock_post.call_count == 1
+
+    # ------------------------------------------------------------------
+    # CUSIP: fallback to SEC DEI facts
+    # ------------------------------------------------------------------
+
+    def test_cusip_falls_back_to_dei_when_openfigi_fails(self, client):
+        """When OpenFIGI raises, the SEC DEI path returns the CUSIP."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            mock_post.side_effect = Exception("OpenFIGI unavailable")
+
+            dei_response = Mock()
+            dei_response.json.return_value = self._make_dei_response(
+                "0001045810", "67066G104"
+            )
+            dei_response.raise_for_status = Mock()
+            mock_get.return_value = dei_response
+
+            cusip = client.get_cusip_from_ticker("NVDA", cik="0001045810")
+
+            assert cusip == "67066G104"
+
+    def test_cusip_dei_fallback_when_openfigi_has_no_cusip_field(self, client):
+        """When OpenFIGI returns no cusip field, DEI path is used."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            # OpenFIGI succeeds but has no cusip field (free-tier typical response)
+            mock_post_resp = Mock()
+            mock_post_resp.json.return_value = self._make_openfigi_response()
+            mock_post_resp.raise_for_status = Mock()
+            mock_post.return_value = mock_post_resp
+
+            dei_response = Mock()
+            dei_response.json.return_value = self._make_dei_response(
+                "0001045810", "67066G104"
+            )
+            dei_response.raise_for_status = Mock()
+            mock_get.return_value = dei_response
+
+            cusip = client.get_cusip_from_ticker("NVDA", cik="0001045810")
+
+            assert cusip == "67066G104"
+
+    # ------------------------------------------------------------------
+    # CUSIP: None-return on total failure
+    # ------------------------------------------------------------------
+
+    def test_cusip_returns_none_when_all_sources_fail(self, client):
+        """Returns None (never raises) when both sources fail."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            mock_post.side_effect = Exception("network error")
+            mock_get.side_effect = Exception("network error")
+
+            cusip = client.get_cusip_from_ticker("NVDA", cik="0001045810")
+
+            assert cusip is None
+
+    # ------------------------------------------------------------------
+    # CUSIP: invalid format rejected
+    # ------------------------------------------------------------------
+
+    def test_cusip_invalid_format_rejected(self, client):
+        """A CUSIP shorter than 9 chars is rejected; falls through to None."""
+        with patch.object(client.session, "post") as mock_post:
+            mock_response = Mock()
+            mock_response.json.return_value = self._make_openfigi_response(
+                cusip="TOOSHORT"
+            )
+            mock_response.raise_for_status = Mock()
+            mock_post.return_value = mock_response
+
+            cusip = client.get_cusip_from_ticker("TEST")  # no CIK → DEI skipped
+
+            assert cusip is None

@@ -480,5 +480,150 @@ class TestDCFOutput(unittest.TestCase):
         self.assertFalse(result["success"])
 
 
+def build_mock_ifrs_metrics():
+    """Build mock XBRL metrics using IFRS-full taxonomy names and 20-F form entries."""
+    return {
+        "entity_name": "FPI TEST CORP",
+        "taxonomy": "ifrs-full",
+        "metrics": {
+            # IFRS revenue key
+            "Revenue:USD": {
+                "name": "Revenue",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 58000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                    {"val": 44000000000, "end": "2023-12-31", "form": "20-F", "filed": "2024-02-21"},
+                    {"val": 37000000000, "end": "2022-12-31", "form": "20-F", "filed": "2023-02-22"},
+                ],
+            },
+            # IFRS operating income key
+            "ProfitLossFromOperatingActivities:USD": {
+                "name": "ProfitLossFromOperatingActivities",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 13000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                    {"val": 9000000000,  "end": "2023-12-31", "form": "20-F", "filed": "2024-02-21"},
+                ],
+            },
+            # IFRS net income key
+            "ProfitLoss:USD": {
+                "name": "ProfitLoss",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 5500000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                    {"val": 3700000000, "end": "2023-12-31", "form": "20-F", "filed": "2024-02-21"},
+                ],
+            },
+            # IFRS D&A key
+            "DepreciationDepletionAmortisationExpense:USD": {
+                "name": "DepreciationDepletionAmortisationExpense",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 3000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                    {"val": 2500000000, "end": "2023-12-31", "form": "20-F", "filed": "2024-02-21"},
+                ],
+            },
+            # IFRS CapEx key
+            "PurchaseOfPropertyPlantAndEquipment:USD": {
+                "name": "PurchaseOfPropertyPlantAndEquipment",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 4000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                    {"val": 3200000000, "end": "2023-12-31", "form": "20-F", "filed": "2024-02-21"},
+                ],
+            },
+            # IFRS OCF key
+            "CashFlowsFromUsedInOperatingActivities:USD": {
+                "name": "CashFlowsFromUsedInOperatingActivities",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 14000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                    {"val": 10000000000, "end": "2023-12-31", "form": "20-F", "filed": "2024-02-21"},
+                ],
+            },
+            # IFRS equity key
+            "EquityAttributableToOwnersOfParent:USD": {
+                "name": "EquityAttributableToOwnersOfParent",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 40000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                ],
+            },
+            # IFRS cash key
+            "CashAndCashEquivalents:USD": {
+                "name": "CashAndCashEquivalents",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 6000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                ],
+            },
+            # IFRS debt key
+            "NoncurrentBorrowings:USD": {
+                "name": "NoncurrentBorrowings",
+                "unit": "USD",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 15000000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                ],
+            },
+            # Shares (using a common IFRS/DEI tag name)
+            "WeightedAverageNumberOfDilutedSharesOutstanding:shares": {
+                "name": "WeightedAverageNumberOfDilutedSharesOutstanding",
+                "unit": "shares",
+                "confidence": 100.0,
+                "values": [
+                    {"val": 1550000000, "end": "2024-12-31", "form": "20-F", "filed": "2025-02-20"},
+                ],
+            },
+        },
+    }
+
+
+class TestDCFIFRSSupport(unittest.TestCase):
+    """Test DCF support for foreign private issuers (20-F + IFRS-full taxonomy)."""
+
+    def setUp(self):
+        self.calc = DCFCalculator()
+        self.metrics = build_mock_ifrs_metrics()
+
+    def test_20f_form_accepted_as_annual(self):
+        """_extract_historicals must accept 20-F entries the same as 10-K."""
+        historicals = self.calc._extract_historicals(self.metrics)
+        # Should have entries from 20-F filings
+        self.assertGreaterEqual(len(historicals), 2)
+
+    def test_ifrs_revenue_extracted(self):
+        """Revenue extracted via IFRS key 'Revenue' (not US-GAAP 'Revenues')."""
+        historicals = self.calc._extract_historicals(self.metrics)
+        latest = historicals[0]
+        # IFRS key is 'Revenue', not 'Revenues'
+        self.assertEqual(latest.get("Revenue"), 58000000000)
+
+    def test_ifrs_fcf_calculated(self):
+        """FCF is calculated for IFRS metrics without error."""
+        historicals = self.calc._extract_historicals(self.metrics)
+        fcf_data = self.calc._calculate_historical_fcf(historicals)
+        self.assertGreater(len(fcf_data), 0)
+        # OCF method should kick in (CashFlowsFromUsedInOperatingActivities)
+        latest_fcf = fcf_data[0]
+        self.assertIsNotNone(latest_fcf.get("operating_cf"))
+        self.assertIsNotNone(latest_fcf.get("fcff"))
+
+    def test_dcf_runs_end_to_end_with_20f(self):
+        """Full DCF pipeline succeeds with IFRS / 20-F data."""
+        result = self.calc.run_dcf("AZN", self.metrics)
+        self.assertTrue(result["success"], msg=result.get("error", ""))
+        fair_value = result["equity_value"]["fair_value_per_share"]
+        self.assertGreater(fair_value, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

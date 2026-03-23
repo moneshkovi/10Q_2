@@ -4,6 +4,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
+## ⚖️ Data Integrity Rules (MANDATORY — Never Override)
+
+These rules apply to every calculation, formula, metric, and output in this project.
+
+1. **Never fabricate or approximate data.** If a value cannot be derived from XBRL, SEC filings, or a verifiable authoritative source, raise an exception or return `None`. Do not substitute a guess, a placeholder, or a hardcoded default that disguises itself as real data.
+
+2. **Raise exceptions over silent failure.** When data is missing, ambiguous, or of unknown quality, raise a descriptive exception or log an explicit warning. Do not silently return 0, None-as-if-valid, or a fallback that a downstream consumer might treat as real.
+
+3. **Use only industry-standard formulas with cited sources.** Every financial formula must match a named standard (e.g., FCFF = OCF − CapEx per CFA Institute; WACC per Damodaran; DCF per JP Morgan equity research methodology). If you are unsure of the correct formula, **ask before implementing**.
+
+4. **Verify outputs against public authoritative sources.** Before accepting computed financials as correct:
+   - Cross-check income statement metrics against SEC EDGAR filings (10-K/10-Q XBRL)
+   - Cross-check cash flow metrics (FCF, OCF, CapEx) against the cash flow statement in the filing
+   - Cross-check market-based inputs (beta, risk-free rate, ERP) against Bloomberg, Damodaran's annual dataset, or US Treasury rates
+   - Flag any figure that cannot be traced back to a primary source
+
+5. **Ask questions when uncertain.** If a formula has multiple valid interpretations (e.g., FCFF vs FCFE, trailing vs forward beta, EV/EBITDA definition), do not silently pick one — ask the user which convention to use.
+
+6. **Sign conventions must be explicit and documented.** Every time CapEx, D&A, interest, or other dual-sign items are used, the sign convention must be stated in a comment (e.g., `# CapEx stored as positive magnitude; subtracted here`). A silent sign flip is a silent bug.
+
+7. **Never mix period types without validation.** Annual (10-K) and quarterly (10-Q) data must never be compared, subtracted, or averaged without explicit period-length normalization. Mixing them without normalization is a known source of delta-NWC and FCF errors (as seen in the GOOG FCF bug, March 2026).
+
+---
+
 ## 🎯 Project Overview
 
 **SEC Filing Parser**: A production-grade system that retrieves and parses financial data from SEC Edgar filings.
