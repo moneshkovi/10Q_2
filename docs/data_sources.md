@@ -236,6 +236,71 @@ Our `config.ALPACA_DATA_URL` always points to `data.alpaca.markets`.
 
 ---
 
+## 4. OpenFIGI (Security Identifier Enrichment)
+
+### What is OpenFIGI?
+
+**OpenFIGI** = Open Financial Instrument Global Identifier. A free, public API
+maintained by Bloomberg to map tickers to standardised security identifiers.
+
+Website: https://www.openfigi.com
+Free tier: API key required, returns FIGI fields only (CUSIP is premium-only).
+
+### What identifiers we fetch
+
+#### FIGI (Financial Instrument Global Identifier)
+A 12-character alphanumeric identifier unique to every financial instrument globally.
+Example: NVDA → `BBG000BBJQV0`
+
+```
+Type:       Composite FIGI (covers all exchanges where the instrument trades)
+Source:     OpenFIGI /v3/mapping endpoint
+XBRL tag:   N/A (not in SEC filings)
+```
+
+#### CUSIP (Committee on Uniform Securities Identification Procedures)
+A 9-character alphanumeric identifier used in North American markets to uniquely
+identify securities. Required for settlement and transfer of ownership.
+Example: NVDA → `67066G104`
+
+We attempt CUSIP from **two sources in priority order**:
+1. **OpenFIGI API** — free tier sometimes includes `cusip` field in the response
+2. **SEC XBRL DEI facts** — `dei:SecurityCUSIP` tag in `companyfacts/{CIK}.json`
+   (fallback; not all companies report this in their XBRL DEI block)
+
+### Why these identifiers?
+
+| Use Case | Identifier Needed |
+|----------|-------------------|
+| Equity research report headers | CUSIP + FIGI |
+| Cross-referencing with Bloomberg data | FIGI |
+| Regulatory filings and trade settlement | CUSIP |
+| Matching securities across data providers | FIGI (universal) |
+
+These are **enrichment data** — non-critical for the DCF valuation, but important
+for professional-grade output. If neither source provides a CUSIP, the pipeline
+continues without it and logs a non-critical warning.
+
+### How it flows through the pipeline
+
+```python
+# Phase 2 in main.py — after CIK lookup
+figi  = client.get_figi_from_ticker(ticker)
+cusip = client.get_cusip_from_ticker(ticker, cik=cik)
+
+result["figi"]  = figi   # Injected into result{}
+result["cusip"] = cusip  # Injected into result{}
+
+# Also passed into metrics_data so it appears in XML and CSV output
+metrics_data["cusip"] = cusip
+metrics_data["figi"]  = figi
+```
+
+### Code location
+`src/sec_client.py` — `get_figi_from_ticker()`, `get_cusip_from_ticker()`, `_query_openfigi()`
+
+---
+
 ## Data Hierarchy (Priority Order)
 
 When the same data is available from multiple sources, we follow this hierarchy:
@@ -243,7 +308,8 @@ When the same data is available from multiple sources, we follow this hierarchy:
 ```
 1. SEC EDGAR XBRL (most authoritative — legal filing)
 2. Alpaca Markets (market price data — real-time)
-3. config.py constants (fallbacks — e.g., industry beta table)
+3. OpenFIGI (security identifiers — enrichment only)
+4. config.py constants (fallbacks — e.g., industry beta table)
 ```
 
 We NEVER synthesize or estimate data from one source to fill gaps in another.

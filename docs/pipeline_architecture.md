@@ -62,15 +62,21 @@ across files. If SEC changes an API URL, you change it in one place.
 
 ---
 
-### Phase 2: SEC Company Lookup
+### Phase 2: SEC Company Lookup + Security Identifier Enrichment
 **Files:** `src/sec_client.py`
 
 What happens:
 1. `get_cik_from_ticker("NVDA")` → fetch `company_tickers.json`, find CIK `0001045810`
 2. `get_filings(cik, ["10-K", "20-F"], years=5)` → filing metadata list
 3. Check `is_xbrl` flag on each filing
+4. `get_figi_from_ticker(ticker)` → OpenFIGI API → composite FIGI (e.g. `BBG000BBJQV0`)
+5. `get_cusip_from_ticker(ticker, cik)` → OpenFIGI first, SEC DEI facts fallback → CUSIP (e.g. `67066G104`)
 
-Output: `result["cik"]`, `result["filings_found"]`
+Output: `result["cik"]`, `result["filings_found"]`, `result["figi"]`, `result["cusip"]`
+
+FIGI and CUSIP are **enrichment data** — non-critical. If unavailable, `None` is stored
+and the pipeline continues. Both values are injected into `metrics_data` so they
+appear in CSV and XML output alongside financial data.
 
 **Key design:** All SEC API calls go through `SECClient._session` (a `requests.Session`)
 with retry logic (3 attempts, exponential backoff) and rate limiting (0.1s between calls).
