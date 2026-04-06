@@ -11,6 +11,7 @@ All methods include comprehensive error handling and logging.
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -464,6 +465,10 @@ class SECClient:
         2. SEC XBRL DEI facts — ``dei:SecurityCUSIP`` in the companyfacts
            endpoint. Requires ``cik``. Most large-cap US companies do NOT
            include this tag, so coverage is limited to smaller filers.
+        3. SEC SC 13G/13D filings — institutional ownership filings always
+           include the CUSIP of the reported security. This is the most
+           reliable source and works for US-domestic, FPI (foreign private
+           issuer), and ADR securities. Requires ``cik``.
 
         CUSIP is enrichment data and is non-critical for pipeline correctness.
         This method never raises; it returns ``None`` when lookup fails.
@@ -471,7 +476,7 @@ class SECClient:
         Args:
             ticker: Stock ticker symbol (e.g., 'NVDA').
             cik: Optional 10-digit zero-padded CIK. When provided, enables
-                the SEC DEI fallback path.
+                the SEC DEI and SC 13G/13D fallback paths.
 
         Returns:
             9-character alphanumeric CUSIP string, or ``None`` if not found.
@@ -531,12 +536,142 @@ class SECClient:
             except Exception as e:
                 logger.debug(f"SEC DEI fallback failed for {ticker}: {e}")
 
+        # ------------------------------------------------------------------
+        # Source 3: SC 13G/13D filings (most reliable — institutional
+        # ownership filings always list the CUSIP of the security).
+        # Works for US-domestic, FPI, and ADR securities.
+        # ------------------------------------------------------------------
+        if cusip is None and cik:
+            cusip = self._extract_cusip_from_13g(cik)
+            if cusip:
+                logger.info(f"CUSIP for {ticker} from SC 13G/13D: {cusip}")
+
         if cusip is None:
             logger.info(f"CUSIP not found for {ticker} (non-critical)")
 
         # Cache result (including None, to avoid repeated failed lookups)
         self.ticker_to_cusip_cache[ticker] = cusip
         return cusip
+
+    def _extract_cusip_from_13g(self, cik: str) -> Optional[str]:
+        """Extract CUSIP from the most recent SC 13G or SC 13D filing.
+
+        SC 13G/13D filings (institutional ownership reports) are required to
+        include the CUSIP of the reported security. This makes them the most
+        reliable public source of CUSIP data on EDGAR.
+
+        Strategy:
+        1. Fetch the company's submission history from the EDGAR submissions API.
+        2. Find the most recent SCHEDULE 13G, 13G/A, 13D, or 13D/A filing.
+        3. Fetch the primary XML/HTM document of that filing.
+        4. Parse the CUSIP from structured XML or from the document text.
+
+        Args:
+            cik: 10-digit zero-padded CIK (e.g., '0001757898').
+
+        Returns:
+            9-character CUSIP string, or ``None`` if not found.
+        """
+        _13G_13D_FORMS = {
+            "SCHEDULE 13G", "SCHEDULE 13G/A",
+            "SC 13G", "SC 13G/A",
+            "SC 13D", "SC 13D/A",
+            "SCHEDULE 13D", "SCHEDULE 13D/A",
+        }
+
+        try:
+            # Step 1: Get the submission index for this CIK
+            url = f"{config.SEC_EDGAR_SUBMISSIONS_API}/CIK{cik}.json"
+            time.sleep(config.SEC_REQUEST_DELAY)
+            response = self.session.get(
+                url, headers=self.headers, timeout=config.REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            recent = data.get("filings", {}).get("recent", {})
+            forms = recent.get("form", [])
+            accessions = recent.get("accessionNumber", [])
+            primary_docs = recent.get("primaryDocument", [])
+
+            # Step 2: Find the most recent 13G/13D filing
+            target_acc = None
+            target_doc = None
+            for i, form in enumerate(forms):
+                if form in _13G_13D_FORMS:
+                    target_acc = accessions[i]
+                    target_doc = primary_docs[i]
+                    break  # Most recent is first in the list
+
+            if not target_acc or not target_doc:
+                logger.debug(f"No SC 13G/13D filing found for CIK {cik}")
+                return None
+
+            # Step 3: Fetch the primary document
+            cik_num = cik.lstrip("0")
+            acc_nd = target_acc.replace("-", "")
+            doc_url = (
+                f"{config.SEC_BASE_URL}/Archives/edgar/data"
+                f"/{cik_num}/{acc_nd}/{target_doc}"
+            )
+            time.sleep(config.SEC_REQUEST_DELAY)
+            doc_resp = self.session.get(
+                doc_url, headers=self.headers, timeout=config.REQUEST_TIMEOUT,
+            )
+            doc_resp.raise_for_status()
+            doc_text = doc_resp.text
+
+            # Step 4a: Try structured XML — look for <cusipNumber> tag
+            xml_match = re.search(
+                r"<cusipNumber[^>]*>\s*([A-Z0-9]{9})\s*</cusipNumber>",
+                doc_text, re.IGNORECASE,
+            )
+            if xml_match:
+                return xml_match.group(1).upper()
+
+            # Step 4b: Try the CUSIP Number field in the XML schema
+            # Pattern: "CUSIP Number(s): G8473T100" or similar
+            schema_match = re.search(
+                r"CUSIP\s+Number(?:\(s\))?[:\s]+([A-Z0-9]{6,9})",
+                doc_text, re.IGNORECASE,
+            )
+            if schema_match:
+                candidate = schema_match.group(1).upper()
+                if len(candidate) == 9 and candidate.isalnum():
+                    return candidate
+
+            # Step 4c: Fallback — strip HTML, search cleaned text for
+            # "(CUSIP Number)" label followed by a 9-char alphanumeric value
+            clean = re.sub(r"<[^>]+>", " ", doc_text)
+            clean = re.sub(r"\s+", " ", clean)
+
+            # Pattern: "... (CUSIP Number) ..." with the value on the
+            # preceding or following line. Common format in SC 13G filings:
+            #   G8473T100 (CUSIP Number)
+            #   or
+            #   (CUSIP Number) G8473T100
+            cusip_re = re.search(
+                r"([A-Z0-9]{9})\s*\(CUSIP\s+Number\)",
+                clean, re.IGNORECASE,
+            )
+            if cusip_re:
+                return cusip_re.group(1).upper()
+
+            cusip_re2 = re.search(
+                r"\(CUSIP\s+Number\)\s*([A-Z0-9]{9})",
+                clean, re.IGNORECASE,
+            )
+            if cusip_re2:
+                return cusip_re2.group(1).upper()
+
+            logger.debug(
+                f"SC 13G/13D found for CIK {cik} ({target_acc}) "
+                f"but CUSIP pattern not matched in document"
+            )
+        except Exception as e:
+            logger.debug(f"SC 13G/13D CUSIP extraction failed for CIK {cik}: {e}")
+
+        return None
 
     def get_xbrl_url(self, accession_number: str) -> Optional[str]:
         """Get URL to XBRL data for a filing.

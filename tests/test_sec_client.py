@@ -708,3 +708,205 @@ class TestGetCUSIP:
             cusip = client.get_cusip_from_ticker("TEST")  # no CIK → DEI skipped
 
             assert cusip is None
+
+    # ------------------------------------------------------------------
+    # CUSIP: SC 13G/13D fallback (Source 3)
+    # ------------------------------------------------------------------
+
+    def _make_submissions_response(self, forms, accessions, primary_docs):
+        """Build a minimal SEC submissions API response."""
+        return {
+            "cik": "0001757898",
+            "name": "TEST CORP",
+            "filings": {
+                "recent": {
+                    "form": forms,
+                    "accessionNumber": accessions,
+                    "primaryDocument": primary_docs,
+                    "filingDate": ["2026-02-13"] * len(forms),
+                }
+            }
+        }
+
+    def _make_13g_html(self, cusip):
+        """Build minimal SC 13G HTML with CUSIP in standard format."""
+        return (
+            f'<html><body>'
+            f'<p>TEST CORP (Name of Issuer)</p>'
+            f'<p>Common Stock (Title of Class of Securities)</p>'
+            f'<p>{cusip} (CUSIP Number)</p>'
+            f'</body></html>'
+        )
+
+    def _make_13g_xml(self, cusip):
+        """Build minimal SC 13G XML with <cusipNumber> tag."""
+        return (
+            f'<?xml version="1.0"?>'
+            f'<edgarSubmission>'
+            f'<cusipNumber>{cusip}</cusipNumber>'
+            f'</edgarSubmission>'
+        )
+
+    def test_cusip_falls_back_to_13g_when_openfigi_and_dei_fail(self, client):
+        """When OpenFIGI and DEI both fail, SC 13G provides the CUSIP."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            mock_post.side_effect = Exception("OpenFIGI unavailable")
+
+            # First GET: companyfacts (DEI) → fails
+            dei_response = Mock()
+            dei_response.json.return_value = {
+                "cik": "0001757898", "entityName": "TEST",
+                "facts": {"dei": {}}
+            }
+            dei_response.raise_for_status = Mock()
+
+            # Second GET: submissions API → returns 13G filing
+            subs_response = Mock()
+            subs_response.json.return_value = self._make_submissions_response(
+                forms=["SCHEDULE 13G"],
+                accessions=["0000102909-26-002378"],
+                primary_docs=["primary_doc.xml"],
+            )
+            subs_response.raise_for_status = Mock()
+
+            # Third GET: the actual 13G document → contains CUSIP
+            doc_response = Mock()
+            doc_response.text = self._make_13g_html("G8473T100")
+            doc_response.raise_for_status = Mock()
+
+            mock_get.side_effect = [dei_response, subs_response, doc_response]
+
+            cusip = client.get_cusip_from_ticker("STE", cik="0001757898")
+
+            assert cusip == "G8473T100"
+
+    def test_cusip_13g_xml_cusipnumber_tag(self, client):
+        """SC 13G XML with <cusipNumber> tag is parsed correctly."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            mock_post.side_effect = Exception("OpenFIGI unavailable")
+
+            dei_response = Mock()
+            dei_response.json.return_value = {
+                "cik": "0002012383", "entityName": "TEST",
+                "facts": {"dei": {}}
+            }
+            dei_response.raise_for_status = Mock()
+
+            subs_response = Mock()
+            subs_response.json.return_value = self._make_submissions_response(
+                forms=["SCHEDULE 13G/A"],
+                accessions=["0000102909-26-000385"],
+                primary_docs=["primary_doc.xml"],
+            )
+            subs_response.raise_for_status = Mock()
+
+            doc_response = Mock()
+            doc_response.text = self._make_13g_xml("09290D101")
+            doc_response.raise_for_status = Mock()
+
+            mock_get.side_effect = [dei_response, subs_response, doc_response]
+
+            cusip = client.get_cusip_from_ticker("BLK", cik="0002012383")
+
+            assert cusip == "09290D101"
+
+    def test_cusip_13g_skipped_when_no_13g_filings(self, client):
+        """Returns None when company has no SC 13G/13D filings."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            mock_post.side_effect = Exception("OpenFIGI unavailable")
+
+            dei_response = Mock()
+            dei_response.json.return_value = {
+                "cik": "0001234567", "entityName": "TEST",
+                "facts": {"dei": {}}
+            }
+            dei_response.raise_for_status = Mock()
+
+            subs_response = Mock()
+            subs_response.json.return_value = self._make_submissions_response(
+                forms=["10-K", "10-Q", "8-K"],
+                accessions=["0001-25-001", "0001-25-002", "0001-25-003"],
+                primary_docs=["doc1.htm", "doc2.htm", "doc3.htm"],
+            )
+            subs_response.raise_for_status = Mock()
+
+            mock_get.side_effect = [dei_response, subs_response]
+
+            cusip = client.get_cusip_from_ticker("TEST", cik="0001234567")
+
+            assert cusip is None
+
+    def test_cusip_13g_handles_sc_13d_form_type(self, client):
+        """SC 13D form type is also recognised and parsed."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            mock_post.side_effect = Exception("OpenFIGI unavailable")
+
+            dei_response = Mock()
+            dei_response.json.return_value = {
+                "cik": "0001234567", "entityName": "TEST",
+                "facts": {"dei": {}}
+            }
+            dei_response.raise_for_status = Mock()
+
+            subs_response = Mock()
+            subs_response.json.return_value = self._make_submissions_response(
+                forms=["SC 13D"],
+                accessions=["0001-26-001"],
+                primary_docs=["doc.htm"],
+            )
+            subs_response.raise_for_status = Mock()
+
+            doc_response = Mock()
+            doc_response.text = self._make_13g_html("88160R101")
+            doc_response.raise_for_status = Mock()
+
+            mock_get.side_effect = [dei_response, subs_response, doc_response]
+
+            cusip = client.get_cusip_from_ticker("TSLA", cik="0001234567")
+
+            assert cusip == "88160R101"
+
+    def test_cusip_13g_schema_cusip_number_pattern(self, client):
+        """CUSIP Number(s): VALUE pattern in document text is parsed."""
+        with patch.object(client.session, "post") as mock_post, \
+             patch.object(client.session, "get") as mock_get:
+
+            mock_post.side_effect = Exception("OpenFIGI unavailable")
+
+            dei_response = Mock()
+            dei_response.json.return_value = {
+                "cik": "0001995520", "entityName": "TEST",
+                "facts": {"dei": {}}
+            }
+            dei_response.raise_for_status = Mock()
+
+            subs_response = Mock()
+            subs_response.json.return_value = self._make_submissions_response(
+                forms=["SCHEDULE 13G/A"],
+                accessions=["0001-26-002"],
+                primary_docs=["doc.xml"],
+            )
+            subs_response.raise_for_status = Mock()
+
+            doc_response = Mock()
+            doc_response.text = (
+                '<html><body>'
+                '<p>SCHEDULE 13G</p>'
+                '<p>CUSIP Number(s): 987910106</p>'
+                '</body></html>'
+            )
+            doc_response.raise_for_status = Mock()
+
+            mock_get.side_effect = [dei_response, subs_response, doc_response]
+
+            cusip = client.get_cusip_from_ticker("YB", cik="0001995520")
+
+            assert cusip == "987910106"

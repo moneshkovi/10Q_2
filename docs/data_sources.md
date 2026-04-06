@@ -263,10 +263,14 @@ A 9-character alphanumeric identifier used in North American markets to uniquely
 identify securities. Required for settlement and transfer of ownership.
 Example: NVDA → `67066G104`
 
-We attempt CUSIP from **two sources in priority order**:
+We attempt CUSIP from **three sources in priority order**:
 1. **OpenFIGI API** — free tier sometimes includes `cusip` field in the response
 2. **SEC XBRL DEI facts** — `dei:SecurityCUSIP` tag in `companyfacts/{CIK}.json`
    (fallback; not all companies report this in their XBRL DEI block)
+3. **SEC SC 13G/13D filings** — institutional ownership filings always include the
+   CUSIP of the reported security. This is the most reliable source and works for
+   US-domestic, FPI (foreign private issuers like STE), and ADR securities.
+   See [CUSIP Lookup Process](#cusip-lookup-process) below for details.
 
 ### Why these identifiers?
 
@@ -297,7 +301,114 @@ metrics_data["figi"]  = figi
 ```
 
 ### Code location
-`src/sec_client.py` — `get_figi_from_ticker()`, `get_cusip_from_ticker()`, `_query_openfigi()`
+`src/sec_client.py` — `get_figi_from_ticker()`, `get_cusip_from_ticker()`, `_query_openfigi()`, `_extract_cusip_from_13g()`
+
+---
+
+## 5. CUSIP Lookup Process
+
+### How CUSIP extraction from SC 13G/13D works
+
+SC 13G and SC 13D are institutional ownership filings. When an institution (e.g., Vanguard,
+BlackRock) accumulates a significant position in a security, they must file a 13G or 13D
+with the SEC. These filings **always include the CUSIP** of the security being reported on.
+
+This makes SC 13G/13D the most reliable public source of CUSIP data on EDGAR — more
+reliable than the 10-K/10-Q cover page (which many companies omit) or the XBRL DEI tag
+(which most companies don't include).
+
+#### Strategy
+
+```
+1. Fetch the company's submission history from EDGAR submissions API
+2. Find the most recent SCHEDULE 13G, 13G/A, SC 13D, or SC 13D/A filing
+3. Fetch the primary XML/HTM document of that filing
+4. Parse CUSIP using three patterns:
+   a. <cusipNumber>G8473T100</cusipNumber>  (structured XML)
+   b. CUSIP Number(s): 09290D101           (schema text pattern)
+   c. G8473T100 (CUSIP Number)             (parenthetical label in HTML)
+```
+
+#### Coverage
+
+| Security Type | Works? | Example |
+|---------------|--------|---------|
+| US-domestic common stock | Yes | BLK → 09290D101 |
+| Foreign private issuer (FPI) | Yes | STE (Ireland) → G8473T100 |
+| ADR shares | Yes | (G-prefix CUSIP) |
+| Multi-class shares | Yes | GOOG (Class C) → 02079K305 |
+| Mutual funds / ETFs | **No** | Require N-CEN/N-PORT parsing (see below) |
+
+#### Verified results
+
+| Ticker | Entity | CUSIP | Source |
+|--------|--------|-------|--------|
+| NVDA | NVIDIA Corp | 67066G104 | SC 13G |
+| AAPL | Apple Inc | 037833100 | SC 13G |
+| MSFT | Microsoft Corp | 594918104 | SC 13G |
+| GOOG | Alphabet Inc (C) | 02079K305 | SC 13G |
+| TSLA | Tesla Inc | 88160R101 | SC 13G |
+| BLK | BlackRock Inc | 09290D101 | SC 13G |
+| STE | STERIS plc (Ireland) | G8473T100 | SC 13G |
+| YB | Yuanbao Inc | 987910106 | SC 13G |
+
+#### Limitations
+
+- **Requires institutional ownership**: Very new or micro-cap companies may not have
+  any 13G/13D filings yet. In practice, any company in the S&P 500 or Russell 3000
+  will have multiple 13G filings.
+- **Returns the CUSIP of whichever share class the institution holds**: For multi-class
+  companies (GOOG vs GOOGL), the CUSIP returned depends on which class the most recent
+  13G filer held.
+- **Not available for mutual funds or ETFs**: These don't have 13G/13D filings filed
+  *about* them. See the Mutual Fund roadmap below.
+
+---
+
+## 6. Mutual Fund / ETF CUSIP Lookup (Roadmap)
+
+Mutual funds and ETFs cannot be looked up via SC 13G/13D because those filings are
+about *stocks held by funds*, not *about the fund itself*.
+
+### What we know
+
+| Fund ticker | Fund family | SEC CIK | Filing types |
+|-------------|-------------|---------|--------------|
+| DODEX | Dodge & Cox Emerging Markets Stock Fund | 0000029440 | N-CSR, 485BPOS, N-CEN |
+| EQTY | Kovitz Core Equity ETF | (not in company_tickers.json) | N-PORT, N-CEN |
+
+### Next steps for mutual fund CUSIP support
+
+1. **N-CEN filings** (Annual Report for Registered Investment Companies):
+   - Filed annually by every fund family
+   - Contains structured XML with series/class identifiers
+   - Maps fund ticker → CUSIP in a machine-readable format
+   - Endpoint: `https://www.sec.gov/cgi-bin/browse-edgar?type=N-CEN&CIK={cik}`
+
+2. **N-PORT filings** (Monthly Portfolio Holdings):
+   - Filed monthly by every mutual fund/ETF
+   - Contains the fund's own identifiers (CUSIP, ISIN, ticker)
+   - Also contains CUSIPs of all portfolio holdings
+
+3. **485BPOS filings** (Post-Effective Amendment to Registration):
+   - Prospectus updates that sometimes list fund share class CUSIPs
+   - Less structured — requires HTML parsing
+
+### Implementation plan
+
+```
+Phase 1: Add N-CEN XML parser
+  - Fetch N-CEN filing for fund family CIK
+  - Parse <seriesId> and <classId> tags
+  - Map ticker → CUSIP from structured data
+
+Phase 2: Add ticker → fund family CIK mapping
+  - SEC's company_tickers.json does not include mutual fund tickers
+  - Use SEC's series/class search or EDGAR full-text search (EFTS)
+  - Endpoint: https://efts.sec.gov/LATEST/search-index?q="DODEX"&forms=N-CEN
+
+Phase 3: Integrate into get_cusip_from_ticker as Source 4
+```
 
 ---
 
